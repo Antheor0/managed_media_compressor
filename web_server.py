@@ -24,6 +24,7 @@ class MediaCompressionWebServer:
         self.scanner = scanner
         self.compressor = compressor
         self.server = None
+        self.active_scanners = []  # Track concurrent scanners
     
     def start(self):
         """Start the web server in a background thread."""
@@ -315,9 +316,21 @@ class MediaCompressionWebServer:
                 if scanner_status.get("status") == "idle":
                     return "<p class='text-muted'>Scanner is currently idle</p>"
                 
-                html = "<div class='scanning p-3 rounded mb-3'>"
+                # Track concurrent scanners in self.active_scanners
+                self.active_scanners = []
                 
-                # Add progress bar if scanning
+                # If we have multiple scan paths running simultaneously
+                for i, path in enumerate(self.scanner.config["media_paths"]):
+                    if self.scanner.is_path_being_scanned(path):
+                        self.active_scanners.append({
+                            "path": path,
+                            "progress": self.scanner.get_path_scan_progress(path),
+                            "files_scanned": self.scanner.get_files_scanned_in_path(path)
+                        })
+                
+                html = ""
+                
+                # Add main progress bar
                 if scanner_status.get("status") == "scanning":
                     html += f"""
                     <div class="progress mb-3">
@@ -332,42 +345,43 @@ class MediaCompressionWebServer:
                     </div>
                     """
                 
-                # Add scanner details
+                # Add overall scanner details
                 html += f"""
-                <div class="row">
-                    <div class="col-md-6">
-                        <p class="mb-1"><strong>Current Directory:</strong></p>
-                        <p class="file-path">{scanner_status.get('current_directory', 'None')}</p>
-                    </div>
-                    <div class="col-md-6">
-                        <div class="row g-2">
-                            <div class="col-6">
-                                <div class="border rounded p-2 text-center">
-                                    <small class="d-block text-muted">Files Scanned</small>
-                                    <span class="fw-bold">{scanner_status.get('files_scanned', 0)}</span>
+                <div class="scanning p-3 rounded mb-3">
+                    <div class="row">
+                        <div class="col-md-6">
+                            <p class="mb-1"><strong>Current Directory:</strong></p>
+                            <p class="file-path">{scanner_status.get('current_directory', 'None')}</p>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="row g-2">
+                                <div class="col-6">
+                                    <div class="border rounded p-2 text-center">
+                                        <small class="d-block text-muted">Files Scanned</small>
+                                        <span class="fw-bold">{scanner_status.get('files_scanned', 0)}</span>
+                                    </div>
                                 </div>
-                            </div>
-                            <div class="col-6">
-                                <div class="border rounded p-2 text-center">
-                                    <small class="d-block text-muted">New Files</small>
-                                    <span class="fw-bold">{scanner_status.get('new_files', 0)}</span>
+                                <div class="col-6">
+                                    <div class="border rounded p-2 text-center">
+                                        <small class="d-block text-muted">New Files</small>
+                                        <span class="fw-bold">{scanner_status.get('new_files', 0)}</span>
+                                    </div>
                                 </div>
-                            </div>
-                            <div class="col-6">
-                                <div class="border rounded p-2 text-center">
-                                    <small class="d-block text-muted">Changed Files</small>
-                                    <span class="fw-bold">{scanner_status.get('changed_files', 0)}</span>
+                                <div class="col-6">
+                                    <div class="border rounded p-2 text-center">
+                                        <small class="d-block text-muted">Changed Files</small>
+                                        <span class="fw-bold">{scanner_status.get('changed_files', 0)}</span>
+                                    </div>
                                 </div>
-                            </div>
-                            <div class="col-6">
-                                <div class="border rounded p-2 text-center">
-                                    <small class="d-block text-muted">Duration</small>
-                                    <span class="fw-bold">{scanner_status.get('duration', 0):.1f}s</span>
+                                <div class="col-6">
+                                    <div class="border rounded p-2 text-center">
+                                        <small class="d-block text-muted">Duration</small>
+                                        <span class="fw-bold">{scanner_status.get('duration', 0):.1f}s</span>
+                                    </div>
                                 </div>
                             </div>
                         </div>
                     </div>
-                </div>
                 """
                 
                 # Add ETA if available
@@ -392,6 +406,36 @@ class MediaCompressionWebServer:
                     """
                 
                 html += "</div>"
+                
+                # Add concurrent scanners if any
+                if len(self.active_scanners) > 0:
+                    html += f"""
+                    <h6 class="mt-3">Concurrent Scanners ({len(self.active_scanners)})</h6>
+                    """
+                    
+                    for scanner in self.active_scanners:
+                        html += f"""
+                        <div class="active-scanner mb-2">
+                            <div class="d-flex justify-content-between align-items-center mb-1">
+                                <strong>Path:</strong>
+                                <span class="badge bg-primary">Scanning</span>
+                            </div>
+                            <p class="file-path mb-2">{scanner.get('path', 'Unknown')}</p>
+                            <div class="progress mb-2" style="height: 8px;">
+                                <div class="progress-bar" role="progressbar" 
+                                    style="width: {scanner.get('progress', 0)}%;" 
+                                    aria-valuenow="{scanner.get('progress', 0)}" 
+                                    aria-valuemin="0" 
+                                    aria-valuemax="100">
+                                </div>
+                            </div>
+                            <div class="d-flex justify-content-between">
+                                <small>{scanner.get('progress', 0):.1f}% complete</small>
+                                <small>{scanner.get('files_scanned', 0)} files</small>
+                            </div>
+                        </div>
+                        """
+                
                 return html
             
             def generate_compressor_html(self, compressor_status):
@@ -400,46 +444,83 @@ class MediaCompressionWebServer:
                 active_jobs_html = ""
                 if compressor_status.get("active_jobs", []):
                     for job in compressor_status["active_jobs"]:
+                        # Determine stage style based on current stage
+                        stage_class = "bg-info"
+                        if job.get('stage') == 'content analysis':
+                            stage_class = "bg-primary"
+                        elif job.get('stage') == 'encoding':
+                            stage_class = "bg-success"
+                        elif job.get('stage') == 'quality check':
+                            stage_class = "bg-warning"
+                        elif job.get('stage') == 'finalizing':
+                            stage_class = "bg-dark"
+                            
                         active_jobs_html += f"""
                         <div class="compression-job mb-3">
                             <div class="d-flex justify-content-between">
                                 <strong>{job.get('filename', 'Unknown')}</strong>
-                                <span class="badge bg-info">{job.get('stage', 'Unknown')}</span>
+                                <span class="badge {stage_class}">{job.get('stage', 'Unknown')}</span>
                             </div>
                             <div class="file-path">{job.get('full_path', 'Unknown')}</div>
-                            <div class="d-flex justify-content-between mt-1 mb-1">
-                                <small>{job.get('size_mb', 0):.2f} MB</small>
-                                <small>Running for {job.get('elapsed_formatted', '0s')}</small>
+                            
+                            <div class="d-flex justify-content-between flex-wrap mt-1 mb-1">
+                                <div class="me-2">
+                                    <small class="text-muted">Size:</small>
+                                    <small class="fw-bold">{job.get('size_mb', 0):.2f} MB</small>
+                                </div>
+                                <div class="me-2">
+                                    <small class="text-muted">Status:</small>
+                                    <small class="fw-bold">{job.get('status', 'unknown')}</small>
+                                </div>
+                                <div>
+                                    <small class="text-muted">Runtime:</small>
+                                    <small class="fw-bold">{job.get('elapsed_formatted', '0s')}</small>
+                                </div>
                             </div>
                         """
                         
-                        # Add progress bar if compressing
+                        # Add progress bar if compressing with improved styling
                         if job.get('progress', 0) > 0:
+                            # Choose progress bar color based on stage
+                            bar_color = "bg-primary"
+                            if job.get('stage') == 'encoding':
+                                bar_color = "bg-success"
+                            elif job.get('stage') == 'quality check':
+                                bar_color = "bg-info"
+                                
                             active_jobs_html += f"""
-                            <div class="progress mt-1">
-                                <div class="progress-bar" role="progressbar" 
+                            <div class="progress mt-1" style="height: 10px;">
+                                <div class="progress-bar {bar_color}" role="progressbar" 
                                     style="width: {job.get('progress', 0)}%;" 
                                     aria-valuenow="{job.get('progress', 0)}" 
                                     aria-valuemin="0" 
                                     aria-valuemax="100">
-                                    {job.get('progress', 0):.1f}%
                                 </div>
                             </div>
+                            <div class="d-flex justify-content-between mt-1">
+                                <small>{job.get('progress', 0):.1f}% Complete</small>
                             """
-                        
-                        # Add ETA if available
-                        if job.get('eta_formatted', "Unknown") != "Unknown":
-                            active_jobs_html += f"""
-                            <div class="mt-1 text-end">
+                            
+                            # Add ETA if available
+                            if job.get('eta_formatted', "Unknown") != "Unknown":
+                                active_jobs_html += f"""
                                 <small>ETA: {job.get('eta_formatted', 'Unknown')}</small>
-                            </div>
-                            """
+                                """
+                            
+                            active_jobs_html += "</div>"
                         
                         active_jobs_html += "</div>"
                 else:
                     active_jobs_html = "<p class='text-muted'>No active compression jobs</p>"
                 
-                # Generate overall status HTML
+                # Calculate compression ratio
+                original_size = compressor_status.get('total_original_size', 0)
+                compressed_size = compressor_status.get('total_compressed_size', 0)
+                compression_ratio = 0
+                if original_size > 0:
+                    compression_ratio = (1 - (compressed_size / original_size)) * 100
+                
+                # Generate overall status HTML with more detailed stats
                 status_html = f"""
                 <table class="table table-sm">
                     <tbody>
@@ -452,58 +533,134 @@ class MediaCompressionWebServer:
                             </td>
                         </tr>
                         <tr>
+                            <th>Running Time</th>
+                            <td>{compressor_status.get('duration_formatted', '0s')}</td>
+                        </tr>
+                        <tr>
                             <th>Files Processed</th>
                             <td>{compressor_status.get('files_processed', 0)}</td>
                         </tr>
                         <tr>
-                            <th>Duration</th>
-                            <td>{compressor_status.get('duration_formatted', '0s')}</td>
+                            <th>Errors</th>
+                            <td>{compressor_status.get('errors', 0)}</td>
+                        </tr>
+                        <tr>
+                            <th>Original Size</th>
+                            <td>{original_size/1024/1024/1024:.2f} GB</td>
+                        </tr>
+                        <tr>
+                            <th>Compressed Size</th>
+                            <td>{compressed_size/1024/1024/1024:.2f} GB</td>
                         </tr>
                         <tr>
                             <th>Space Saved</th>
-                            <td>
-                                {(compressor_status.get('total_original_size', 0) - compressor_status.get('total_compressed_size', 0))/1024/1024/1024:.2f} GB
-                            </td>
+                            <td>{(original_size - compressed_size)/1024/1024/1024:.2f} GB ({compression_ratio:.1f}%)</td>
                         </tr>
                     </tbody>
                 </table>
                 """
                 
-                # Add ETA information
+                # Add ETA information with improved styling
                 eta_html = ""
                 if "eta" in compressor_status and compressor_status.get("status", "") == "compressing":
                     eta_info = compressor_status["eta"]
+                    
+                    # Create a progress pie or bar visualization of completion
+                    percent_done = 0
+                    total_files = eta_info.get('total_files', 0) + compressor_status.get('files_processed', 0)
+                    if total_files > 0:
+                        percent_done = (compressor_status.get('files_processed', 0) / total_files) * 100
+                    
+                    # Add average time per file if available
+                    avg_time = eta_info.get('average_time_per_file', 0)
+                    avg_time_str = f"{avg_time:.1f}s" if avg_time < 60 else f"{avg_time/60:.1f}m"
+                    
                     eta_html = f"""
                     <div class="card mb-3">
-                        <div class="card-header">
+                        <div class="card-header bg-primary text-white">
                             <h6 class="mb-0">Estimated Completion</h6>
                         </div>
                         <div class="card-body">
-                            <div class="row text-center">
-                                <div class="col-6">
-                                    <small class="d-block text-muted">Remaining Files</small>
-                                    <span class="fw-bold">{eta_info.get('total_files', 0)}</span>
+                            <div class="progress mb-3" style="height: 15px;">
+                                <div class="progress-bar bg-success" role="progressbar" 
+                                    style="width: {percent_done}%;" 
+                                    aria-valuenow="{percent_done}" 
+                                    aria-valuemin="0" 
+                                    aria-valuemax="100">
+                                    {percent_done:.1f}%
                                 </div>
-                                <div class="col-6">
-                                    <small class="d-block text-muted">Estimated Time</small>
-                                    <span class="fw-bold">{eta_info.get('eta_formatted', 'Unknown')}</span>
+                            </div>
+                            
+                            <div class="row text-center g-2">
+                                <div class="col-3">
+                                    <div class="border rounded p-2">
+                                        <small class="d-block text-muted">Processed</small>
+                                        <span class="fw-bold">{compressor_status.get('files_processed', 0)}</span>
+                                    </div>
+                                </div>
+                                <div class="col-3">
+                                    <div class="border rounded p-2">
+                                        <small class="d-block text-muted">Remaining</small>
+                                        <span class="fw-bold">{eta_info.get('total_files', 0)}</span>
+                                    </div>
+                                </div>
+                                <div class="col-3">
+                                    <div class="border rounded p-2">
+                                        <small class="d-block text-muted">Avg Time/File</small>
+                                        <span class="fw-bold">{avg_time_str}</span>
+                                    </div>
+                                </div>
+                                <div class="col-3">
+                                    <div class="border rounded p-2 bg-light">
+                                        <small class="d-block text-muted">ETA</small>
+                                        <span class="fw-bold">{eta_info.get('eta_formatted', 'Unknown')}</span>
+                                    </div>
                                 </div>
                             </div>
                         </div>
                     </div>
                     """
                 
+                # Add a "Quick Stats" card for current session stats
+                quick_stats_html = f"""
+                <div class="card mb-3">
+                    <div class="card-header">
+                        <h6 class="mb-0">Current Session</h6>
+                    </div>
+                    <div class="card-body p-0">
+                        <div class="row g-0 text-center">
+                            <div class="col-4 border-end p-2">
+                                <small class="d-block text-muted">Processed</small>
+                                <span class="fw-bold">{compressor_status.get('files_processed', 0)}</span>
+                            </div>
+                            <div class="col-4 border-end p-2">
+                                <small class="d-block text-muted">Errors</small>
+                                <span class="fw-bold text-danger">{compressor_status.get('errors', 0)}</span>
+                            </div>
+                            <div class="col-4 p-2">
+                                <small class="d-block text-muted">Running</small>
+                                <span class="fw-bold">{compressor_status.get('duration_formatted', '0s')}</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                """
+                
                 # Combine all sections
                 html = f"""
                 <div class="mb-3">
-                    <h6>Active Jobs ({len(compressor_status.get('active_jobs', []))})</h6>
+                    <div class="d-flex justify-content-between align-items-center mb-2">
+                        <h6 class="mb-0">Active Jobs ({len(compressor_status.get('active_jobs', []))})</h6>
+                        <small class="text-muted">Concurrent tasks: {self.compressor.config.get('max_concurrent_jobs', 1)}</small>
+                    </div>
                     {active_jobs_html}
                 </div>
                 
+                {quick_stats_html}
                 {eta_html}
                 
                 <div>
-                    <h6>Compression Status</h6>
+                    <h6>Compression Details</h6>
                     {status_html}
                 </div>
                 """

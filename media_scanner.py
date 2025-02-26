@@ -28,7 +28,7 @@ class MediaScanner:
         self.changed_files_found = 0
         self.scan_start_time = None
         self.current_directory = None
-        # Add scanning state
+        self.path_stats = {}  # Track stats for each path being scanned
         self.is_scanning = False
         self.scan_progress = 0
         self.total_dirs = 0
@@ -342,6 +342,22 @@ class MediaScanner:
         """Run the media scanner synchronously (wrapper for async function)."""
         return asyncio.run(self.scan_all_directories_async())
     
+    def is_path_being_scanned(self, path: str) -> bool:
+        """Check if a specific path is currently being scanned."""
+        return path in self.path_stats and self.path_stats[path]["scanning"]
+    
+    def get_path_scan_progress(self, path: str) -> float:
+        """Get the scan progress for a specific path."""
+        if path in self.path_stats:
+            return self.path_stats[path].get("progress", 0)
+        return 0
+    
+    def get_files_scanned_in_path(self, path: str) -> int:
+        """Get number of files scanned in a specific path."""
+        if path in self.path_stats:
+            return self.path_stats[path].get("files_scanned", 0)
+        return 0
+    
     def get_scan_status(self):
         """Get the current status of the scanning process."""
         if not self.is_scanning:
@@ -359,6 +375,18 @@ class MediaScanner:
             remaining_time = total_estimated_time - duration
             eta = remaining_time
         
+        # Get path-specific info
+        active_paths = []
+        for path, stats in self.path_stats.items():
+            if stats.get("scanning", False):
+                active_paths.append({
+                    "path": path,
+                    "progress": stats.get("progress", 0),
+                    "files_scanned": stats.get("files_scanned", 0),
+                    "new_files": stats.get("new_files", 0),
+                    "changed_files": stats.get("changed_files", 0)
+                })
+        
         return {
             "status": "scanning",
             "current_directory": self.current_directory,
@@ -367,5 +395,8 @@ class MediaScanner:
             "changed_files": self.changed_files_found,
             "duration": duration,
             "progress": self.scan_progress,
-            "eta_seconds": eta
+            "eta_seconds": eta,
+            "active_paths": active_paths,
+            "total_dirs": self.total_dirs,
+            "processed_dirs": self.processed_dirs
         }
