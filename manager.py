@@ -5,6 +5,7 @@ import logging
 import os
 import json
 import signal
+import sys
 from typing import Dict, Any, Optional, List
 from contextlib import contextmanager
 from config_validator import ConfigValidator
