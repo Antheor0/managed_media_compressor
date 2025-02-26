@@ -10,12 +10,12 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Tuple, Optional, Any, TypedDict
 from contextlib import contextmanager
 
-from .content_analyzer import ContentAnalyzer
-from .compression_engine import CompressionEngine
-from .notification_service import NotificationService
-from .resource_monitor import ResourceMonitor
-from .file_processor import FileProcessor
-from .constants import *
+from content_analyzer import ContentAnalyzer
+from compression_engine import CompressionEngine
+from notification_service import NotificationService
+from resource_monitor import ResourceMonitor
+from file_processor import FileProcessor
+from constants import *
 
 logger = logging.getLogger('MediaCompressor.Compressor')
 

@@ -6,10 +6,10 @@ import os
 import logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import List, Dict, Tuple, Optional, Set, Any, Callable
-from .media_scanner import MediaScanner
-from .media_compressor import MediaCompressor
-from .media_database import MediaDatabase
-from.config_validator import ConfigValidator
+from media_scanner import MediaScanner
+from media_compressor import MediaCompressor
+from media_database import MediaDatabase
+from config_validator import ConfigValidator
 
 logger = logging.getLogger('MediaCompressor.WebServer')
 

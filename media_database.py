@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Dict, List
 from datetime import time
 
-from .constants import *
+from constants import *
 
 logger = logging.getLogger('MediaCompressor.Database')
 

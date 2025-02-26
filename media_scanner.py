@@ -9,8 +9,8 @@ import queue
 from typing import Dict
 from concurrent.futures import ThreadPoolExecutor
 
-from .media_database import MediaDatabase
-from .constants import *
+from media_database import MediaDatabase
+from constants import *
 
 logger = logging.getLogger('MediaCompressor.Scanner')
 

@@ -1,0 +1,9 @@
+Flask==2.0.1
+psutil==5.9.0
+pillow==9.0.1
+pymediainfo==5.1.0
+watchdog==2.1.6
+requests==2.27.1
+SQLAlchemy==1.4.37
+jsonschema==4.4.0
+python-dotenv==0.20.0

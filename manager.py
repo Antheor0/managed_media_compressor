@@ -7,12 +7,12 @@ import json
 import signal
 from typing import Dict, Any, Optional, List
 from contextlib import contextmanager
-from .config_validator import ConfigValidator
-from .media_database import MediaDatabase
-from .media_scanner import MediaScanner
-from .media_compressor import MediaCompressor
-from .web_server import MediaCompressionWebServer
-from .constants import DEFAULT_CONFIG
+from config_validator import ConfigValidator
+from media_database import MediaDatabase
+from media_scanner import MediaScanner
+from media_compressor import MediaCompressor
+from web_server import MediaCompressionWebServer
+from constants import DEFAULT_CONFIG
 
 logger = logging.getLogger('MediaCompressor.Manager')
 

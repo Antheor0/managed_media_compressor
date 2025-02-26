@@ -18,7 +18,7 @@ logging.basicConfig(
 
 logger = logging.getLogger('MediaCompressor')
 
-from .manager import MediaCompressionManager
+from manager import MediaCompressionManager
 
 def main():
     """Main entry point for the media compressor script."""
