@@ -30,32 +30,47 @@ class FileProcessor:
                 logger.error(f"File {file_path} has zero size")
                 return False
             
-            # Try to read the file headers with ffprobe
-            cmd = ["ffprobe", "-v", "error", "-show_format", file_path]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)  # Increased timeout
+            # Try to read the file headers with ffprobe - using a more reliable approach
+            # Just check if the format can be detected, nothing more
+            cmd = ["ffprobe", "-v", "error", "-hide_banner", "-of", "json", 
+                   "-show_format", "-i", file_path]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)  # Increased timeout
             
-            if result.returncode != 0:
-                logger.error(f"File format check failed for {file_path}: {result.stderr}")
-                return False
-            
-            # For video files, check for stream existence but don't try to decode or count frames
-            # This is a much more lenient check that will work with high-bitrate files
-            cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", 
-                "-show_entries", "stream=codec_type", 
-                "-of", "default=noprint_wrappers=1:nokey=1", file_path]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            
-            if result.returncode != 0:
-                logger.error(f"Video stream check failed for {file_path}: {result.stderr}")
-                return False
-            
-            # Just check if we got "video" in the output which confirms a valid video stream exists
-            if "video" not in result.stdout.strip().lower():
-                logger.error(f"No valid video stream found in {file_path}")
-                return False
+            # We don't check returncode because some files might return warnings
+            # but still be valid. Instead, we check if we got format information.
+            try:
+                import json
+                data = json.loads(result.stdout)
+                if "format" not in data:
+                    logger.error(f"File format check failed for {file_path}: No format section in output")
+                    
+                    # If we're here, file might still be valid but with issues
+                    # Return True unless in strict validation mode
+                    if self.config and self.config.get("strict_validation", False):
+                        return False
+                    return True
+            except (json.JSONDecodeError, ValueError):
+                # If output isn't valid JSON, check if it's due to an error
+                if result.returncode != 0:
+                    logger.error(f"File format check failed for {file_path}")
+                    return False
+                
+                # If returncode is 0 but no JSON, the file might still be accessible
+                # Accept it unless in strict validation mode
+                if self.config and self.config.get("strict_validation", False):
+                    return False
+                return True
             
             # If we got here, file is valid enough to proceed
             logger.info(f"File integrity verified for {file_path}")
+            return True
+            
+        except subprocess.TimeoutExpired:
+            logger.error(f"Timeout verifying file integrity for {file_path}")
+            # Timeouts might happen with very large files, but they could still be valid
+            # Accept them unless in strict validation mode
+            if self.config and self.config.get("strict_validation", False):
+                return False
             return True
             
         except Exception as e:

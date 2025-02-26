@@ -58,45 +58,62 @@ class ContentAnalyzer:
         try:
             os.makedirs(frames_dir, exist_ok=True)
             
-            # Get video info and check if we can determine basic properties
-            video_info = self.get_video_info(file_path)
-            duration = video_info.get("duration_s", 0)
-            
-            if duration <= 0:
-                logger.warning(f"Could not determine duration for {file_path}, assuming live action")
-                return "live_action"
-            
-            # Check for common animation indicators in the filename
+            # First, check for common animation indicators in the filename
+            # This is the fastest method and doesn't require opening the file
             filename = os.path.basename(file_path).lower()
-            animation_keywords = ['animation', 'animated', 'anime', 'cartoon', 'pixar', 'disney']
+            animation_keywords = ['animation', 'animated', 'anime', 'cartoon', 'pixar', 'disney', 
+                                 'dreamworks', 'studio ghibli', 'cgi', '3d animation']
             
             if any(keyword in filename for keyword in animation_keywords):
                 logger.info(f"Detected likely animation based on filename: {filename}")
                 return "animation"
+                
+            # Additional filename-based heuristics
+            # Check for common animation file patterns with extended patterns
+            if re.search(r'(anime|cartoon|animation|animated|子供向け|アニメ)', filename, re.IGNORECASE):
+                logger.info(f"Detected likely animation based on filename pattern: {filename}")
+                return "animation"
+                
+            # Look for common anime release patterns
+            if re.search(r'\[\s*\d{3,4}p\s*\].*\[(BD|BluRay|Web-DL)', filename, re.IGNORECASE):
+                if any(term in filename.upper() for term in ["FLAC", "VORBIS", "AAC", "HEVC", "X265"]):
+                    logger.info(f"Detected likely animation based on release pattern: {filename}")
+                    return "animation"
             
-            # Extract frames for analysis
-            frames = self._extract_frames_for_analysis(file_path, frames_dir, duration)
+            # Get video info and check if we can determine basic properties
+            # Only do this if filename analysis didn't work
+            video_info = self.get_video_info(file_path)
+            duration = video_info.get("duration_s", 0)
             
-            # If we couldn't extract enough frames, return default
-            if len(frames) < 3:
-                logger.warning(f"Could not extract enough frames for {file_path}, assuming live action")
+            # If we can't determine duration, default to live action
+            if duration <= 0:
+                logger.warning(f"Could not determine duration for {file_path}, assuming live action")
                 return "live_action"
             
-            # Try content analysis methods
-            content_type = self._analyze_frames(frames)
+            # Skip the expensive frame analysis if this is a very long video (likely live action)
+            # Most animated content is under 3 hours unless it's a compilation
+            if duration > 10800:  # 3 hours
+                logger.info(f"Long duration content ({duration/3600:.1f} hours), defaulting to live action")
+                return "live_action"
             
-            # Additional filename-based heuristics as fallback
-            if content_type == "live_action":
-                # Check for common animation file patterns
-                if re.search(r'(anime|cartoon|animation)', filename, re.IGNORECASE):
-                    content_type = "animation"
-                # Look for common anime/animation release patterns
-                elif re.search(r'\[\s*\d{3,4}p\s*\].*\[(BD|BluRay|Web-DL)', filename, re.IGNORECASE):
-                    if "FLAC" in filename or "VORBIS" in filename:  # Common in anime releases
-                        content_type = "animation"
+            # Try to extract a few frames for quick analysis
+            # Limit the number of frames and extraction time to keep this fast
+            try:
+                # Only try to extract frames if we have a duration
+                frames = self._extract_frames_for_analysis(file_path, frames_dir, duration, max_frames=5, timeout=30)
+                
+                # If we got enough frames, do a quick analysis
+                if len(frames) >= 3:
+                    content_type = self._analyze_frames(frames)
+                    logger.info(f"Frame analysis determined content type: {content_type}")
+                    return content_type
+            except Exception as frame_error:
+                logger.warning(f"Frame analysis failed, falling back: {str(frame_error)}")
+                # Continue with fallbacks
             
-            logger.info(f"Detected content type for {os.path.basename(file_path)}: {content_type}")
-            return content_type
+            # Default to live action if all else fails
+            logger.info(f"Defaulting to live action for: {os.path.basename(file_path)}")
+            return "live_action"
             
         except Exception as e:
             logger.error(f"Error detecting content type for {file_path}: {str(e)}")
@@ -106,25 +123,25 @@ class ContentAnalyzer:
             # Clean up frames no matter what happened
             self._cleanup_frame_files(frames, frames_dir)
     
-    def _extract_frames_for_analysis(self, file_path: str, frames_dir: str, duration: float) -> List[str]:
+    def _extract_frames_for_analysis(self, file_path: str, frames_dir: str, duration: float, max_frames=10, timeout=60) -> List[str]:
         """Extract frames from video for content analysis."""
         frames = []
         frames_extracted = False
         
         # Method 1: Try FFmpeg's scene detection to get keyframes
         try:
-            # Get 5-10 scene change frames if possible
+            # Get max_frames scene change frames if possible
             scene_cmd = [
                 "ffmpeg", "-i", file_path, 
                 "-vf", "select='gt(scene,0.3)',showinfo", 
                 "-vsync", "vfr", 
                 "-frame_pts", "1",
-                "-frames:v", "10", 
+                "-frames:v", str(max_frames), 
                 "-y",
                 os.path.join(frames_dir, "scene_%03d.jpg")
             ]
             
-            subprocess.run(scene_cmd, capture_output=True, timeout=60)
+            subprocess.run(scene_cmd, capture_output=True, timeout=timeout)
             
             # Check if frames were created
             scene_frames = glob.glob(os.path.join(frames_dir, "scene_*.jpg"))
