@@ -213,3 +213,8 @@ cython_debug/
 
 #my config
 /config.json
+
+# Database files
+*.db
+media_compression.db
+media_compression_backup.db
