@@ -78,11 +78,12 @@ class MediaCompressionManager:
     
     def _handle_shutdown(self, signum, frame):
         """Handle shutdown signals."""
-        logger.info(f"Received signal {signum}, initiating graceful shutdown")
+        logger.info(f"Received signal {signum}, initiating immediate shutdown")
         self.shutdown_requested = True
         
-        # Stop compression if running
+        # Stop all active operations
         self.compressor.stop_compression()
+        self.scanner.stop_scan()
         
         # Clean up resources
         self._cleanup_resources()
@@ -92,6 +93,11 @@ class MediaCompressionManager:
             with self.daemon_lock:
                 self.scan_in_progress = False
                 self.compression_in_progress = False
+        
+        # Exit immediately on SIGINT (Ctrl+C) if not in daemon mode
+        if signum == signal.SIGINT and not hasattr(self, 'in_daemon_mode') or not self.in_daemon_mode:
+            logger.info("Exiting immediately")
+            sys.exit(1)
     
     def _cleanup_resources(self):
         """Clean up resources before shutdown."""
@@ -203,6 +209,7 @@ class MediaCompressionManager:
     def run_daemon(self):
         """Run in daemon mode, continuously scanning and compressing."""
         logger.info("Starting in daemon mode")
+        self.in_daemon_mode = True
         
         try:
             while not self.shutdown_requested:
@@ -274,5 +281,6 @@ class MediaCompressionManager:
                 "error"
             )
         finally:
+            self.in_daemon_mode = False
             self._cleanup_resources()
             logger.info("Daemon mode exited")

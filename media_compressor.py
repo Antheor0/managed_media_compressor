@@ -115,11 +115,18 @@ class MediaCompressor:
             self.db.log_system_event("compression_resumed", "Compression jobs resumed", "info")
     
     def stop_compression(self):
-        """Stop all compression jobs."""
+        """Stop all compression jobs immediately."""
         with self.jobs_lock:
             self.running = False
-            # Give active jobs a chance to complete
-            logger.info("Stopping compression jobs (may take a moment to complete active jobs)")
+            self.paused = True  # Also pause to stop current processing
+            
+            # Mark all active jobs as interrupted
+            for job_info in self.active_jobs.values():
+                file_path = job_info["file_path"]
+                self.db.update_file_status(file_path, STATUS_PENDING, 
+                                          error_message="Interrupted by user")
+            
+            logger.info("Stopping compression jobs immediately")
             self.db.log_system_event("compression_stopped", "Compression jobs stopped by user", "info")
     
     def prioritize_file(self, file_path: str, priority: int = 10):

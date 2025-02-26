@@ -33,6 +33,7 @@ class MediaScanner:
         self.scan_progress = 0
         self.total_dirs = 0
         self.processed_dirs = 0
+        self.stop_requested = False  # Flag to handle interruptions
     
     def _get_file_checksum(self, file_path: str) -> str:
         """Calculate a fast file checksum by hashing parts of the file."""
@@ -94,6 +95,11 @@ class MediaScanner:
             # Get total file count first for better progress tracking
             total_files_estimate = 0
             for root, dirs, files in os.walk(directory, topdown=True):
+                # Check if stop requested
+                if self.stop_requested:
+                    logger.info(f"Scan interrupted for directory: {directory}")
+                    return
+                    
                 for file_name in files:
                     if any(file_name.lower().endswith(ext) for ext in self.config["extensions"]):
                         total_files_estimate += 1
@@ -112,7 +118,16 @@ class MediaScanner:
             
             # Now do the actual scan with better progress tracking
             for root, dirs, files in os.walk(directory):
+                # Check if stop requested
+                if self.stop_requested:
+                    logger.info(f"Scan interrupted while processing directory: {root}")
+                    return
+                    
                 for file_name in files:
+                    # Check if stop requested before processing each file
+                    if self.stop_requested:
+                        return
+                        
                     file_path = os.path.join(root, file_name)
                     
                     # Quick check for valid files
@@ -201,15 +216,16 @@ class MediaScanner:
                 if self.total_dirs > 0:
                     self.scan_progress = (self.processed_dirs / self.total_dirs) * 100
             
-            # Final batch update
-            if files_to_update:
+            # Final batch update if not interrupted
+            if files_to_update and not self.stop_requested:
                 self.db.bulk_update_statuses(files_to_update)
             
-            # Record directory scan stats
-            duration = time.time() - start_time
-            self.db.record_directory_scan(directory, file_count, total_size, duration)
-            
-            logger.info(f"Completed scan of {directory}: found {file_count} files, {self.new_files_found} new, {self.changed_files_found} changed")
+            # Record directory scan stats if not interrupted
+            if not self.stop_requested:
+                duration = time.time() - start_time
+                self.db.record_directory_scan(directory, file_count, total_size, duration)
+                
+                logger.info(f"Completed scan of {directory}: found {file_count} files, {self.new_files_found} new, {self.changed_files_found} changed")
             
         except Exception as e:
             logger.error(f"Error scanning directory {directory}: {str(e)}")
@@ -338,8 +354,15 @@ class MediaScanner:
             "status": "completed"
         }
     
+    def stop_scan(self):
+        """Stop all scanning operations."""
+        logger.info("Stopping scan operations...")
+        self.stop_requested = True
+        self.db.log_system_event("scan_stopped", "Scan operations stopped by user", "info")
+    
     def run_scan(self):
         """Run the media scanner synchronously (wrapper for async function)."""
+        self.stop_requested = False  # Reset stop flag
         return asyncio.run(self.scan_all_directories_async())
     
     def is_path_being_scanned(self, path: str) -> bool:

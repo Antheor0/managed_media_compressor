@@ -68,5 +68,19 @@ def main():
         manager.run_compression(args.limit, args.now)
 
 
+def signal_handler(signum, frame):
+    """Handle keyboard interrupts and termination signals."""
+    logger.info(f"Received signal {signum}, initiating immediate shutdown")
+    sys.exit(1)
+
 if __name__ == "__main__":
-    main()
+    # Register signal handlers directly in main
+    import signal
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user, exiting immediately")
+        sys.exit(1)
