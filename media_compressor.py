@@ -15,14 +15,26 @@ import concurrent
 import smtplib
 import shutil
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Dict, Tuple, Optional, Set, Any, Callable
+from typing import List, Dict, Tuple, Optional, Set, Any, Callable, TypedDict
 import queue
 import sqlite3
+from contextlib import contextmanager
 from .media_database import MediaDatabase
 from .quality_validator import QualityValidator
 from .constants import *
 
 logger = logging.getLogger('MediaCompressor.Compressor')
+
+class JobInfo(TypedDict):
+    file_path: str
+    file_name: str
+    start_time: float
+    progress: float
+    file_size: int
+    status: str
+    estimated_time: int
+    eta: Optional[float]
+    current_stage: str
 
 class MediaCompressor:
     """
@@ -38,7 +50,7 @@ class MediaCompressor:
         os.makedirs(self.config["temp_dir"], exist_ok=True)
         
         # Track current state
-        self.active_jobs = {}  # Dictionary to track active jobs: {thread_id: file_path}
+        self.active_jobs: Dict[int, JobInfo] = {}  # Dictionary to track active jobs: {thread_id: job_info}
         self.jobs_lock = threading.RLock()  # Lock for thread-safe access to active_jobs
         self.compression_start_time = None
         self.stats = {
@@ -49,14 +61,24 @@ class MediaCompressor:
             "errors": 0
         }
         
-        # 6. Dynamic Job Management
+        # Dynamic Job Management
         self.paused = False
         self.running = True
         self.job_queue = queue.PriorityQueue()
         self.job_history = {}  # Track job history for priority
         self.dependencies_checked = False
     
-    # 7. Dependency Checking
+    @contextmanager
+    def _db_connection(self):
+        """Context manager for database connections to ensure proper cleanup."""
+        conn = None
+        try:
+            conn = sqlite3.connect(self.config["database_path"])
+            yield conn
+        finally:
+            if conn:
+                conn.close()
+    
     def check_dependencies(self) -> bool:
         """Check if all required external tools are available."""
         if self.dependencies_checked:
@@ -91,7 +113,6 @@ class MediaCompressor:
         self.dependencies_checked = True
         return True
     
-    # 2. Resource Management
     def check_system_resources(self) -> bool:
         """Check if system has sufficient resources for compression."""
         # Check disk space
@@ -115,7 +136,6 @@ class MediaCompressor:
         
         return True
     
-    # 6. Dynamic Job Management
     def pause_compression(self):
         """Pause all active compression jobs."""
         with self.jobs_lock:
@@ -133,14 +153,13 @@ class MediaCompressor:
         with self.jobs_lock:
             self.paused = False
             # Reset paused file statuses
-            conn = sqlite3.connect(self.config["database_path"])
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE processed_files SET status = ? WHERE status = ?",
-                (STATUS_PENDING, STATUS_PAUSED)
-            )
-            conn.commit()
-            conn.close()
+            with self._db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE processed_files SET status = ? WHERE status = ?",
+                    (STATUS_PENDING, STATUS_PAUSED)
+                )
+                conn.commit()
             
             logger.info("Compression resumed")
             self.db.log_system_event("compression_resumed", "Compression jobs resumed", "info")
@@ -168,21 +187,20 @@ class MediaCompressor:
             file_size = 0
             try:
                 file_size = os.path.getsize(file_path)
-            except:
-                pass
+            except OSError as e:
+                logger.warning(f"Could not get file size for {file_path}: {e}")
                 
             # Get estimated time
             estimated_time = 0
             try:
-                conn = sqlite3.connect(self.config["database_path"])
-                cursor = conn.cursor()
-                cursor.execute("SELECT estimated_time FROM processed_files WHERE file_path = ?", (file_path,))
-                result = cursor.fetchone()
-                if result and result[0]:
-                    estimated_time = result[0]
-                conn.close()
-            except:
-                pass
+                with self._db_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT estimated_time FROM processed_files WHERE file_path = ?", (file_path,))
+                    result = cursor.fetchone()
+                    if result and result[0]:
+                        estimated_time = result[0]
+            except sqlite3.Error as e:
+                logger.warning(f"Database error getting estimated time: {e}")
             
             self.active_jobs[thread_id] = {
                 "file_path": file_path,
@@ -196,7 +214,7 @@ class MediaCompressor:
                 "current_stage": "initializing"
             }
             
-    def _update_job_status(self, status: str, progress: float = None, stage: str = None):
+    def _update_job_status(self, status: str, progress: Optional[float] = None, stage: Optional[str] = None):
         """Update the status of the current compression job with ETA calculation."""
         with self.jobs_lock:
             thread_id = threading.get_ident()
@@ -268,182 +286,16 @@ class MediaCompressor:
                 logger.info(f"Detected likely animation based on filename: {filename}")
                 return "animation"
             
-            # Extract a few frames for analysis - try two methods
-            frames_extracted = False
-            
-            # Method 1: Try FFmpeg's scene detection to get keyframes
-            try:
-                # Get 5-10 scene change frames if possible
-                scene_cmd = [
-                    "ffmpeg", "-i", file_path, 
-                    "-vf", "select='gt(scene,0.3)',showinfo", 
-                    "-vsync", "vfr", 
-                    "-frame_pts", "1",
-                    "-frames:v", "10", 
-                    "-y",
-                    os.path.join(frames_dir, "scene_%03d.jpg")
-                ]
-                
-                subprocess.run(scene_cmd, capture_output=True, timeout=60)
-                
-                # Check if frames were created
-                scene_frames = glob.glob(os.path.join(frames_dir, "scene_*.jpg"))
-                if len(scene_frames) >= 3:
-                    frames = scene_frames[:5]  # Use up to 5 frames
-                    frames_extracted = True
-                    logger.debug(f"Extracted {len(frames)} scene frames")
-            except Exception as e:
-                logger.debug(f"Scene detection failed: {str(e)}, trying regular interval sampling")
-            
-            # Method 2: If scene detection failed, use regular interval sampling
-            if not frames_extracted:
-                # Sample frames at regular intervals
-                interval = duration / 6  # 5 frames + buffer
-                for i in range(1, 6):
-                    time_pos = interval * i
-                    frame_path = os.path.join(frames_dir, f"frame_{i}.jpg")
-                    
-                    try:
-                        extract_cmd = [
-                            "ffmpeg", "-ss", str(time_pos), "-i", file_path,
-                            "-vframes", "1", "-q:v", "2", frame_path, "-y"
-                        ]
-                        subprocess.run(extract_cmd, capture_output=True, timeout=10, check=True)
-                        if os.path.exists(frame_path) and os.path.getsize(frame_path) > 0:
-                            frames.append(frame_path)
-                    except Exception as e:
-                        logger.debug(f"Error extracting frame at {time_pos}s: {str(e)}")
+            # Extract frames for analysis
+            frames = self._extract_frames_for_analysis(file_path, frames_dir, duration)
             
             # If we couldn't extract enough frames, return default
             if len(frames) < 3:
                 logger.warning(f"Could not extract enough frames for {file_path}, assuming live action")
                 return "live_action"
             
-            # Try multiple content analysis methods
-            animation_score = 0
-            analysis_success = False
-            
-            # Method 1: Use ImageMagick if available
-            imagemagick_available = self._check_imagemagick_available()
-            
-            if imagemagick_available:
-                try:
-                    for frame in frames[:3]:  # Analyze first 3 frames
-                        # Use ImageMagick to analyze colors and edges
-                        try:
-                            # Count unique colors
-                            color_cmd = ["identify", "-format", "%k", frame]
-                            color_result = subprocess.run(color_cmd, capture_output=True, text=True, timeout=5)
-                            
-                            if color_result.returncode == 0 and color_result.stdout.strip():
-                                unique_colors = int(color_result.stdout.strip())
-                                
-                                # Get edge score (higher for animation)
-                                edge_cmd = [
-                                    "convert", frame, "-edge", "1", "-format", "%[mean]", "info:"
-                                ]
-                                edge_result = subprocess.run(edge_cmd, capture_output=True, text=True, timeout=5)
-                                
-                                if edge_result.returncode == 0 and edge_result.stdout.strip():
-                                    edge_value = float(edge_result.stdout.strip())
-                                    
-                                    # Animation typically has fewer colors and more defined edges
-                                    if unique_colors < 10000 and edge_value > 0.05:
-                                        animation_score += 1
-                                        
-                                    analysis_success = True
-                        except Exception as e:
-                            logger.debug(f"Error analyzing frame with ImageMagick {frame}: {str(e)}")
-                except Exception as e:
-                    logger.debug(f"ImageMagick analysis failed: {str(e)}")
-            
-            # Method 2: If ImageMagick failed, use FFmpeg for simple edge detection
-            if not analysis_success:
-                try:
-                    for frame in frames[:3]:
-                        # Use FFmpeg for edge detection
-                        edge_frame = os.path.join(frames_dir, f"edge_{os.path.basename(frame)}")
-                        
-                        # Create edge-detected version of the frame
-                        edge_cmd = [
-                            "ffmpeg", "-i", frame, 
-                            "-filter_complex", "edgedetect=low=0.1:high=0.4", 
-                            "-y", edge_frame
-                        ]
-                        
-                        subprocess.run(edge_cmd, capture_output=True, timeout=10)
-                        
-                        if os.path.exists(edge_frame):
-                            # Check percentage of edge pixels
-                            histogram_cmd = [
-                                "ffmpeg", "-i", edge_frame,
-                                "-filter_complex", "histogram,metadata=print:file=-",
-                                "-f", "null", "-"
-                            ]
-                            
-                            hist_result = subprocess.run(histogram_cmd, capture_output=True, text=True, timeout=10)
-                            
-                            # Check if edge percentage is high (typical for animation)
-                            edge_percentage = 0
-                            if "lavfi.histogram.0.level" in hist_result.stderr:
-                                # Extract edge percentage from histogram data
-                                match = re.search(r'lavfi\.histogram\.0\.level=(\d+\.\d+)', hist_result.stderr)
-                                if match:
-                                    edge_percentage = float(match.group(1))
-                                    if edge_percentage > 0.15:  # Animation threshold
-                                        animation_score += 1
-                            
-                            analysis_success = True
-                except Exception as e:
-                    logger.debug(f"FFmpeg edge analysis failed: {str(e)}")
-            
-            # Method 3: Final fallback - simple color count analysis using FFmpeg
-            if not analysis_success:
-                try:
-                    for frame in frames[:3]:
-                        # Get frame dimensions
-                        probe_cmd = [
-                            "ffprobe", "-v", "error", 
-                            "-select_streams", "v:0", 
-                            "-show_entries", "stream=width,height", 
-                            "-of", "csv=p=0", frame
-                        ]
-                        
-                        dim_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=5)
-                        if dim_result.returncode == 0 and dim_result.stdout.strip():
-                            dimensions = dim_result.stdout.strip().split(',')
-                            if len(dimensions) == 2:
-                                width, height = int(dimensions[0]), int(dimensions[1])
-                                total_pixels = width * height
-                                
-                                # Simplified analysis - check for large areas of solid color
-                                # Sample random points in the image
-                                color_cmd = [
-                                    "ffmpeg", "-i", frame,
-                                    "-filter_complex", "signalstats=stat=tout:c=r+g+b",
-                                    "-f", "null", "-"
-                                ]
-                                
-                                stats_result = subprocess.run(color_cmd, capture_output=True, text=True, timeout=10)
-                                
-                                # Animations often have higher contrast/saturation
-                                if "Parsed_signalstats" in stats_result.stderr:
-                                    if "excessive max values" in stats_result.stderr or "low PSNR values" in stats_result.stderr:
-                                        animation_score += 1
-                                
-                                analysis_success = True
-                except Exception as e:
-                    logger.debug(f"Color analysis failed: {str(e)}")
-            
-            # Final content type determination
-            content_type = "live_action"  # Default
-            
-            # If we got a score, determine the type
-            if analysis_success:
-                if animation_score >= 2:
-                    content_type = "animation"
-                elif animation_score >= 1:
-                    content_type = "mixed"
+            # Try content analysis methods
+            content_type = self._analyze_frames(frames)
             
             # Additional filename-based heuristics as fallback
             if content_type == "live_action":
@@ -464,18 +316,219 @@ class MediaCompressor:
         
         finally:
             # Clean up frames no matter what happened
-            for frame in frames:
-                try:
-                    if os.path.exists(frame):
-                        os.remove(frame)
-                except:
-                    pass
+            self._cleanup_frame_files(frames, frames_dir)
+    
+    def _extract_frames_for_analysis(self, file_path: str, frames_dir: str, duration: float) -> List[str]:
+        """Extract frames from video for content analysis."""
+        frames = []
+        frames_extracted = False
+        
+        # Method 1: Try FFmpeg's scene detection to get keyframes
+        try:
+            # Get 5-10 scene change frames if possible
+            scene_cmd = [
+                "ffmpeg", "-i", file_path, 
+                "-vf", "select='gt(scene,0.3)',showinfo", 
+                "-vsync", "vfr", 
+                "-frame_pts", "1",
+                "-frames:v", "10", 
+                "-y",
+                os.path.join(frames_dir, "scene_%03d.jpg")
+            ]
             
+            subprocess.run(scene_cmd, capture_output=True, timeout=60)
+            
+            # Check if frames were created
+            scene_frames = glob.glob(os.path.join(frames_dir, "scene_*.jpg"))
+            if len(scene_frames) >= 3:
+                frames = scene_frames[:5]  # Use up to 5 frames
+                frames_extracted = True
+                logger.debug(f"Extracted {len(frames)} scene frames")
+        except Exception as e:
+            logger.debug(f"Scene detection failed: {str(e)}, trying regular interval sampling")
+        
+        # Method 2: If scene detection failed, use regular interval sampling
+        if not frames_extracted:
+            # Sample frames at regular intervals
+            interval = duration / 6  # 5 frames + buffer
+            for i in range(1, 6):
+                time_pos = interval * i
+                frame_path = os.path.join(frames_dir, f"frame_{i}.jpg")
+                
+                try:
+                    extract_cmd = [
+                        "ffmpeg", "-ss", str(time_pos), "-i", file_path,
+                        "-vframes", "1", "-q:v", "2", frame_path, "-y"
+                    ]
+                    subprocess.run(extract_cmd, capture_output=True, timeout=10, check=True)
+                    if os.path.exists(frame_path) and os.path.getsize(frame_path) > 0:
+                        frames.append(frame_path)
+                except Exception as e:
+                    logger.debug(f"Error extracting frame at {time_pos}s: {str(e)}")
+        
+        return frames
+    
+    def _analyze_frames(self, frames: List[str]) -> str:
+        """Analyze frames to determine content type."""
+        animation_score = 0
+        analysis_success = False
+        
+        # Method 1: Use ImageMagick if available
+        if self._check_imagemagick_available():
+            analysis_success = self._analyze_with_imagemagick(frames, animation_score)
+        
+        # Method 2: If ImageMagick failed, use FFmpeg for simple edge detection
+        if not analysis_success:
+            analysis_success = self._analyze_with_ffmpeg_edges(frames, animation_score)
+        
+        # Method 3: Final fallback - simple color count analysis using FFmpeg
+        if not analysis_success:
+            analysis_success = self._analyze_with_ffmpeg_color(frames, animation_score)
+        
+        # Final content type determination
+        if analysis_success:
+            if animation_score >= 2:
+                return "animation"
+            elif animation_score >= 1:
+                return "mixed"
+        
+        return "live_action"  # Default
+
+    def _analyze_with_imagemagick(self, frames: List[str], animation_score: int) -> Tuple[bool, int]:
+        """Analyze frames using ImageMagick."""
+        success = False
+        score = animation_score
+        
+        try:
+            for frame in frames[:3]:  # Analyze first 3 frames
+                # Use ImageMagick to analyze colors and edges
+                try:
+                    # Count unique colors
+                    color_cmd = ["identify", "-format", "%k", frame]
+                    color_result = subprocess.run(color_cmd, capture_output=True, text=True, timeout=5)
+                    
+                    if color_result.returncode == 0 and color_result.stdout.strip():
+                        unique_colors = int(color_result.stdout.strip())
+                        
+                        # Get edge score (higher for animation)
+                        edge_cmd = [
+                            "convert", frame, "-edge", "1", "-format", "%[mean]", "info:"
+                        ]
+                        edge_result = subprocess.run(edge_cmd, capture_output=True, text=True, timeout=5)
+                        
+                        if edge_result.returncode == 0 and edge_result.stdout.strip():
+                            edge_value = float(edge_result.stdout.strip())
+                            
+                            # Animation typically has fewer colors and more defined edges
+                            if unique_colors < 10000 and edge_value > 0.05:
+                                score += 1
+                                
+                            success = True
+                except Exception as e:
+                    logger.debug(f"Error analyzing frame with ImageMagick {frame}: {str(e)}")
+        except Exception as e:
+            logger.debug(f"ImageMagick analysis failed: {str(e)}")
+        
+        return success, score
+
+    def _analyze_with_ffmpeg_edges(self, frames: List[str], animation_score: int) -> Tuple[bool, int]:
+        """Analyze frames using FFmpeg edge detection."""
+        success = False
+        score = animation_score
+        
+        try:
+            for frame in frames[:3]:
+                # Use FFmpeg for edge detection
+                edge_frame = os.path.join(os.path.dirname(frame), f"edge_{os.path.basename(frame)}")
+                
+                # Create edge-detected version of the frame
+                edge_cmd = [
+                    "ffmpeg", "-i", frame, 
+                    "-filter_complex", "edgedetect=low=0.1:high=0.4", 
+                    "-y", edge_frame
+                ]
+                
+                subprocess.run(edge_cmd, capture_output=True, timeout=10)
+                
+                if os.path.exists(edge_frame):
+                    # Check percentage of edge pixels
+                    histogram_cmd = [
+                        "ffmpeg", "-i", edge_frame,
+                        "-filter_complex", "histogram,metadata=print:file=-",
+                        "-f", "null", "-"
+                    ]
+                    
+                    hist_result = subprocess.run(histogram_cmd, capture_output=True, text=True, timeout=10)
+                    
+                    # Check if edge percentage is high (typical for animation)
+                    if "lavfi.histogram.0.level" in hist_result.stderr:
+                        # Extract edge percentage from histogram data
+                        match = re.search(r'lavfi\.histogram\.0\.level=(\d+\.\d+)', hist_result.stderr)
+                        if match:
+                            edge_percentage = float(match.group(1))
+                            if edge_percentage > 0.15:  # Animation threshold
+                                score += 1
+                    
+                    success = True
+        except Exception as e:
+            logger.debug(f"FFmpeg edge analysis failed: {str(e)}")
+        
+        return success, score
+
+    def _analyze_with_ffmpeg_color(self, frames: List[str], animation_score: int) -> Tuple[bool, int]:
+        """Analyze frames using FFmpeg color statistics."""
+        success = False
+        score = animation_score
+        
+        try:
+            for frame in frames[:3]:
+                # Get frame dimensions
+                probe_cmd = [
+                    "ffprobe", "-v", "error", 
+                    "-select_streams", "v:0", 
+                    "-show_entries", "stream=width,height", 
+                    "-of", "csv=p=0", frame
+                ]
+                
+                dim_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=5)
+                if dim_result.returncode == 0 and dim_result.stdout.strip():
+                    dimensions = dim_result.stdout.strip().split(',')
+                    if len(dimensions) == 2:
+                        # Simplified analysis - check for large areas of solid color
+                        # Sample random points in the image
+                        color_cmd = [
+                            "ffmpeg", "-i", frame,
+                            "-filter_complex", "signalstats=stat=tout:c=r+g+b",
+                            "-f", "null", "-"
+                        ]
+                        
+                        stats_result = subprocess.run(color_cmd, capture_output=True, text=True, timeout=10)
+                        
+                        # Animations often have higher contrast/saturation
+                        if "Parsed_signalstats" in stats_result.stderr:
+                            if "excessive max values" in stats_result.stderr or "low PSNR values" in stats_result.stderr:
+                                score += 1
+                        
+                        success = True
+        except Exception as e:
+            logger.debug(f"Color analysis failed: {str(e)}")
+        
+        return success, score
+    
+    def _cleanup_frame_files(self, frames: List[str], frames_dir: str):
+        """Clean up frame files after analysis."""
+        for frame in frames:
             try:
-                if os.path.exists(frames_dir):
-                    shutil.rmtree(frames_dir, ignore_errors=True)
-            except:
+                if os.path.exists(frame):
+                    os.remove(frame)
+            except OSError:
                 pass
+        
+        try:
+            if os.path.exists(frames_dir):
+                shutil.rmtree(frames_dir, ignore_errors=True)
+        except OSError:
+            pass
     
     def _check_imagemagick_available(self) -> bool:
         """Check if ImageMagick is installed and available."""
@@ -485,10 +538,10 @@ class MediaCompressor:
                                     text=True, 
                                     timeout=2)
             return result.returncode == 0 and "ImageMagick" in result.stdout
-        except:
+        except (subprocess.SubprocessError, FileNotFoundError):
             return False
     
-    def get_compression_settings(self, file_path: str) -> Dict:
+    def get_compression_settings(self, file_path: str) -> Dict[str, Any]:
         """Get optimal compression settings based on content type."""
         if not self.config["compression"]["content_aware"]:
             return {"quality": 22, "preset": "slow"}
@@ -512,7 +565,7 @@ class MediaCompressor:
                 "preset": "slow"
             }
     
-    def check_disk_space(self, path: str, required_mb: int = None) -> bool:
+    def check_disk_space(self, path: str, required_mb: Optional[int] = None) -> bool:
         """Ensure sufficient disk space exists before compressing."""
         if required_mb is None:
             required_mb = self.config["min_free_space_mb"]
@@ -539,7 +592,6 @@ class MediaCompressor:
             logger.error(f"Error checking disk space on {path}: {str(e)}")
             return False
     
-    # 3. Error Recovery - File validation
     def verify_file_integrity(self, file_path: str) -> bool:
         """Verify that a file is valid and not corrupted - less aggressive version."""
         self._update_job_status("verifying file", stage="integrity check")
@@ -582,21 +634,19 @@ class MediaCompressor:
             logger.error(f"Error verifying file integrity for {file_path}: {str(e)}")
             return False                    
     
-    # 5. Code Refactoring - Breaking down the compress_file method
-    def prepare_compression(self, file_path: str) -> Tuple[str, Dict]:
+    def prepare_compression(self, file_path: str) -> Tuple[str, Dict[str, Any]]:
         """Prepare for compression by setting up output paths and settings."""
         # Generate temporary output path
         file_name = os.path.basename(file_path)
         base_name, ext = os.path.splitext(file_name)
         temp_output = os.path.join(self.config["temp_dir"], f"{base_name}_compressed{ext}")
         
-        # Detect content type for optimal settings
-        content_type = "live_action"
+        # Get content-specific compression settings
         compression_settings = {}
         
         if self.config["compression"]["content_aware"]:
-            content_type = self.detect_content_type(file_path)
             compression_settings = self.get_compression_settings(file_path)
+            content_type = compression_settings.get("content_type", "live_action")
             
             # Update NVENC options with content-aware settings
             nvenc_base = self.config["compression"]["nvenc_options"]
@@ -612,13 +662,14 @@ class MediaCompressor:
             )
         else:
             nvenc_options = self.config["compression"]["nvenc_options"]
+            content_type = "live_action"
         
         return temp_output, {
             "nvenc_options": nvenc_options,
             "content_type": content_type
         }
     
-    def run_handbrake(self, file_path: str, temp_output: str, settings: Dict) -> bool:
+    def run_handbrake(self, file_path: str, temp_output: str, settings: Dict[str, Any]) -> bool:
         """Run HandBrakeCLI command with progress monitoring."""
         # Build HandBrakeCLI command
         handbrake_cmd = [
@@ -701,7 +752,7 @@ class MediaCompressor:
             logger.error(f"Error during compression: {str(e)}")
             return False
     
-    def finalize_compression(self, file_path: str, temp_output: str, original_size: int) -> Dict:
+    def finalize_compression(self, file_path: str, temp_output: str, original_size: int) -> Dict[str, Any]:
         """Finalize compression by validating quality and replacing the original file."""
         # Update job status
         self._update_job_status("validating quality", stage="quality check")
@@ -712,7 +763,7 @@ class MediaCompressor:
             try:
                 if os.path.exists(temp_output):
                     os.remove(temp_output)
-            except:
+            except OSError:
                 pass
             return {
                 "status": "error",
@@ -749,7 +800,7 @@ class MediaCompressor:
             # Clean up
             try:
                 os.remove(temp_output)
-            except:
+            except OSError:
                 pass
             
             return {
@@ -769,7 +820,7 @@ class MediaCompressor:
             logger.error(f"Compressed file integrity check failed for {temp_output}")
             try:
                 os.remove(temp_output)
-            except:
+            except OSError:
                 pass
             return {
                 "status": "error",
@@ -800,7 +851,7 @@ class MediaCompressor:
             "checksum": checksum
         }
     
-    def compress_file(self, file_path: str) -> Dict:
+    def compress_file(self, file_path: str) -> Dict[str, Any]:
         """Compress a video file using HandBrakeCLI with NVENC."""
         start_time = time.time()
         
@@ -929,7 +980,7 @@ class MediaCompressor:
             if 'temp_output' in locals() and os.path.exists(temp_output):
                 try:
                     os.remove(temp_output)
-                except:
+                except OSError:
                     pass
             
             # Update database with error status
@@ -1025,7 +1076,7 @@ class MediaCompressor:
         except Exception as e:
             logger.error(f"Error sending email notification: {str(e)}")
     
-    def _send_webhook(self, data: Dict):
+    def _send_webhook(self, data: Dict[str, Any]):
         """Send a webhook notification."""
         try:
             webhook_url = self.config["notifications"]["webhook"]["url"]
@@ -1092,8 +1143,7 @@ class MediaCompressor:
         
         return True
     
-    # 9. Better Progress Tracking
-    def get_estimated_completion_time(self) -> Dict:
+    def get_estimated_completion_time(self) -> Dict[str, Any]:
         """Get estimated completion time for all pending files."""
         stats = self.db.get_statistics()
         
@@ -1116,21 +1166,7 @@ class MediaCompressor:
             total_eta = total_eta / concurrent_jobs
         
         # Format the ETA
-        if total_eta <= 0:
-            eta_formatted = "< 1 minute"
-        elif total_eta < 60:
-            eta_formatted = f"{int(total_eta)} seconds"
-        elif total_eta < 3600:
-            minutes = int(total_eta // 60)
-            eta_formatted = f"{minutes} minute{'s' if minutes > 1 else ''}"
-        elif total_eta < 86400:
-            hours = int(total_eta // 3600)
-            minutes = int((total_eta % 3600) // 60)
-            eta_formatted = f"{hours} hour{'s' if hours > 1 else ''}, {minutes} minute{'s' if minutes > 1 else ''}"
-        else:
-            days = int(total_eta // 86400)
-            hours = int((total_eta % 86400) // 3600)
-            eta_formatted = f"{days} day{'s' if days > 1 else ''}, {hours} hour{'s' if hours > 1 else ''}"
+        eta_formatted = self._format_time_remaining(total_eta)
         
         pending_files = stats["status_counts"].get(STATUS_PENDING, 0)
         
@@ -1141,7 +1177,25 @@ class MediaCompressor:
             "average_time_per_file": avg_time
         }
     
-    def process_compression_queue(self, limit: int = None, force_now: bool = False):
+    def _format_time_remaining(self, seconds: float) -> str:
+        """Format ETA into human-readable string."""
+        if seconds <= 0:
+            return "< 1 minute"
+        elif seconds < 60:
+            return f"{int(seconds)} seconds"
+        elif seconds < 3600:
+            minutes = int(seconds // 60)
+            return f"{minutes} minute{'s' if minutes > 1 else ''}"
+        elif seconds < 86400:
+            hours = int(seconds // 3600)
+            minutes = int((seconds % 3600) // 60)
+            return f"{hours} hour{'s' if hours > 1 else ''}, {minutes} minute{'s' if minutes > 1 else ''}"
+        else:
+            days = int(seconds // 86400)
+            hours = int((seconds % 86400) // 3600)
+            return f"{days} day{'s' if days > 1 else ''}, {hours} hour{'s' if hours > 1 else ''}"
+    
+    def process_compression_queue(self, limit: Optional[int] = None, force_now: bool = False) -> Dict[str, Any]:
         """Process files in the compression queue."""
         if not self.check_dependencies():
             logger.error("Dependency check failed, cannot start compression")
@@ -1178,7 +1232,7 @@ class MediaCompressor:
         files_processed = 0
         errors = 0
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.config["max_concurrent_jobs"]) as executor:
+        with ThreadPoolExecutor(max_workers=self.config["max_concurrent_jobs"]) as executor:
             # Create a map of future to file data
             future_to_file = {}
             
@@ -1224,23 +1278,33 @@ class MediaCompressor:
                         error_message=str(e)[:1000]
                     )
         
-        # Record session statistics
+        # Record session statistics if any files were processed
         if files_processed > 0 or errors > 0:
-            # Calculate savings
-            if total_original_size > 0:
-                savings_percentage = (1 - (total_compressed_size / total_original_size)) * 100
-            else:
-                savings_percentage = 0
-            
-            # Update overall stats
-            self.stats["files_processed"] = files_processed
-            self.stats["total_original_size"] = total_original_size
-            self.stats["total_compressed_size"] = total_compressed_size
-            self.stats["errors"] = errors
-            
-            # Record in database
-            try:
-                conn = sqlite3.connect(self.config["database_path"])
+            return self._record_compression_statistics(
+                start_time, files_processed, errors, total_original_size, total_compressed_size)
+        else:
+            logger.info("No files were successfully compressed.")
+            return {"status": "completed", "files_processed": 0, "errors": errors}
+    
+    def _record_compression_statistics(self, start_time: float, files_processed: int, 
+                                     errors: int, total_original_size: int, 
+                                     total_compressed_size: int) -> Dict[str, Any]:
+        """Record compression statistics to database and generate summary."""
+        # Calculate savings
+        if total_original_size > 0:
+            savings_percentage = (1 - (total_compressed_size / total_original_size)) * 100
+        else:
+            savings_percentage = 0
+        
+        # Update overall stats
+        self.stats["files_processed"] = files_processed
+        self.stats["total_original_size"] = total_original_size
+        self.stats["total_compressed_size"] = total_compressed_size
+        self.stats["errors"] = errors
+        
+        # Record in database
+        try:
+            with self._db_connection() as conn:
                 cursor = conn.cursor()
                 
                 cursor.execute('''
@@ -1258,42 +1322,39 @@ class MediaCompressor:
                 ))
                 
                 conn.commit()
-                conn.close()
-            except sqlite3.Error as e:
-                logger.error(f"Database error recording stats: {str(e)}")
-            
-            # Send completion notification
-            if self.config["notifications"]["email"]["on_completion"] or self.config["notifications"]["webhook"]["on_completion"]:
-                self.send_notification(
-                    f"Compression session completed. "
-                    f"Files processed: {files_processed}, "
-                    f"Errors: {errors}, "
-                    f"Space saved: {(total_original_size-total_compressed_size)/1024/1024/1024:.2f}GB ({savings_percentage:.2f}%)",
-                    level="info"
-                )
-            
-            logger.info(f"Compression session completed.")
-            logger.info(f"Files processed: {files_processed}")
-            logger.info(f"Errors: {errors}")
-            logger.info(f"Total original size: {total_original_size/1024/1024/1024:.2f}GB")
-            logger.info(f"Total compressed size: {total_compressed_size/1024/1024/1024:.2f}GB")
-            logger.info(f"Space saved: {(total_original_size-total_compressed_size)/1024/1024/1024:.2f}GB ({savings_percentage:.2f}%)")
-            logger.info(f"Total duration: {(time.time() - start_time)/60:.2f} minutes")
-            
-            return {
-                "status": "completed",
-                "files_processed": files_processed,
-                "errors": errors,
-                "total_original_size": total_original_size,
-                "total_compressed_size": total_compressed_size,
-                "savings_percentage": savings_percentage,
-                "duration": time.time() - start_time
-            }
-        else:
-            logger.info("No files were successfully compressed.")
-            return {"status": "completed", "files_processed": 0, "errors": errors}
+        except sqlite3.Error as e:
+            logger.error(f"Database error recording stats: {str(e)}")
+        
+        # Send completion notification
+        if self.config["notifications"]["email"]["on_completion"] or self.config["notifications"]["webhook"]["on_completion"]:
+            self.send_notification(
+                f"Compression session completed. "
+                f"Files processed: {files_processed}, "
+                f"Errors: {errors}, "
+                f"Space saved: {(total_original_size-total_compressed_size)/1024/1024/1024:.2f}GB ({savings_percentage:.2f}%)",
+                level="info"
+            )
+        
+        # Log completion details
+        logger.info(f"Compression session completed.")
+        logger.info(f"Files processed: {files_processed}")
+        logger.info(f"Errors: {errors}")
+        logger.info(f"Total original size: {total_original_size/1024/1024/1024:.2f}GB")
+        logger.info(f"Total compressed size: {total_compressed_size/1024/1024/1024:.2f}GB")
+        logger.info(f"Space saved: {(total_original_size-total_compressed_size)/1024/1024/1024:.2f}GB ({savings_percentage:.2f}%)")
+        logger.info(f"Total duration: {(time.time() - start_time)/60:.2f} minutes")
+        
+        return {
+            "status": "completed",
+            "files_processed": files_processed,
+            "errors": errors,
+            "total_original_size": total_original_size,
+            "total_compressed_size": total_compressed_size,
+            "savings_percentage": savings_percentage,
+            "duration": time.time() - start_time
+        }
     
-    def get_compression_status(self):
+    def get_compression_status(self) -> Dict[str, Any]:
         """Get the current status of the compression process."""
         if self.compression_start_time is None:
             return {"status": "idle", "active_jobs": []}
@@ -1347,7 +1408,7 @@ class MediaCompressor:
             "eta": eta_info
         }
     
-    def _format_time(self, seconds):
+    def _format_time(self, seconds: Optional[float]) -> str:
         """Format time in seconds to a human readable string."""
         if seconds is None:
             return "Unknown"
