@@ -369,17 +369,11 @@ class MediaCompressionWebServer:
                             </div>
                         </div>
                     </div>
-                    <script>
-                    window.onload = function() {
-                        var container = document.querySelector('.logs-container');
-                        if (container) {
-                            container.scrollTop = container.scrollHeight;
-                        }
-                    };
-                    </script>
+                    
                 </body>
                 </html>
                 """
+                # Note: Removed the problematic JavaScript to fix syntax errors
                 return html
                 
             def generate_scanner_stats_html(self, scanner_status):
