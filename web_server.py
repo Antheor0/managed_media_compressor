@@ -189,6 +189,8 @@ class MediaCompressionWebServer:
                 # Get individual status counts safely
                 pending_files = status_counts.get('pending', 0)
                 completed_files = status_counts.get('completed', 0)
+                skipped_files = status_counts.get('skipped', 0)
+                error_files = status_counts.get('error', 0)
                 
                 # Get space saved with safe defaults
                 space_saved = db_stats.get('space_saved', 0)
@@ -198,13 +200,20 @@ class MediaCompressionWebServer:
                 scanner_status_text = scanner_status.get('status', 'unknown').upper()
                 scanner_badge_class = "bg-primary" if scanner_status.get('status') == 'scanning' else "bg-secondary"
                 
+                # Get scan count when scanning
+                files_scanned = scanner_status.get('files_scanned', 0)
+                
                 # Compressor status
                 compressor_status_text = compressor_status.get('status', 'unknown').upper()
                 compressor_badge_class = "bg-success" if compressor_status.get('status') == 'compressing' else "bg-secondary"
                 if compressor_status.get('paused', False):
                     compressor_badge_class = "bg-warning"
+                    compressor_status_text = "PAUSED"
                 
-                # The HTML template construction (same as original)...
+                # Extract active job info
+                active_jobs = compressor_status.get('active_jobs', [])
+                
+                # The HTML template construction
                 html = f"""<!DOCTYPE html>
                 <html>
                 <head>
@@ -234,6 +243,24 @@ class MediaCompressionWebServer:
                         .event-error {{ border-color: #dc3545; }}
                         .event-warning {{ border-color: #ffc107; }}
                         .event-info {{ border-color: #0dcaf0; }}
+                        .logs-container {{ height: 250px; overflow-y: auto; background-color: #212529; color: #f8f9fa; 
+                                          font-family: monospace; font-size: 0.9rem; padding: 10px; border-radius: 4px; }}
+                        .log-entry {{ margin-bottom: 4px; border-bottom: 1px solid #444; padding-bottom: 4px; }}
+                        .info-box {{ padding: 10px; border-radius: 5px; margin-bottom: 10px; }}
+                        .status-indicator {{ width: 12px; height: 12px; border-radius: 50%; display: inline-block; margin-right: 5px; }}
+                        .status-active {{ background-color: #28a745; }}
+                        .status-inactive {{ background-color: #dc3545; }}
+                        .status-pending {{ background-color: #ffc107; }}
+                        .status-row {{ display: flex; justify-content: space-between; margin-bottom: 5px; }}
+                        .status-label {{ font-weight: bold; }}
+                        .status-value {{ text-align: right; }}
+                        .metric-circle {{ width: 120px; height: 120px; margin: 0 auto; display: flex; 
+                                         flex-direction: column; justify-content: center; align-items: center;
+                                         border-radius: 50%; border: 6px solid #e9ecef; }}
+                        .metric-value {{ font-size: 1.5rem; font-weight: bold; margin-bottom: 0; line-height: 1; }}
+                        .metric-label {{ font-size: 0.8rem; color: #6c757d; }}
+                        .text-xs {{ font-size: 0.75rem; }}
+                        .text-sm {{ font-size: 0.875rem; }}
                     </style>
                 </head>
                 <body>
@@ -270,46 +297,613 @@ class MediaCompressionWebServer:
                             </div>
                         </div>
                         
-                        <!-- Summary Cards -->
+                        <!-- Scanner Stats Box -->
                         <div class="row mb-4">
-                            <div class="col-md-3">
-                                <div class="card">
-                                    <div class="card-body text-center">
-                                        <h6 class="card-title text-muted">Total Files</h6>
-                                        <div class="summary-value">{total_files}</div>
+                            <div class="col-md-6">
+                                <div class="card h-100">
+                                    <div class="card-header d-flex justify-content-between align-items-center">
+                                        <h5 class="mb-0">Scanner Status</h5>
+                                        <span class="badge {scanner_badge_class}">{scanner_status_text}</span>
+                                    </div>
+                                    <div class="card-body">
+                                        {self.generate_scanner_stats_html(scanner_status)}
                                     </div>
                                 </div>
                             </div>
-                            <div class="col-md-3">
-                                <div class="card">
-                                    <div class="card-body text-center">
-                                        <h6 class="card-title text-muted">Pending Compression</h6>
-                                        <div class="summary-value">{pending_files}</div>
+                            
+                            <!-- Compression Stats Box -->
+                            <div class="col-md-6">
+                                <div class="card h-100">
+                                    <div class="card-header d-flex justify-content-between align-items-center">
+                                        <h5 class="mb-0">Compression Status</h5>
+                                        <span class="badge {compressor_badge_class}">{compressor_status_text}</span>
                                     </div>
-                                </div>
-                            </div>
-                            <div class="col-md-3">
-                                <div class="card">
-                                    <div class="card-body text-center">
-                                        <h6 class="card-title text-muted">Completed</h6>
-                                        <div class="summary-value">{completed_files}</div>
-                                    </div>
-                                </div>
-                            </div>
-                            <div class="col-md-3">
-                                <div class="card">
-                                    <div class="card-body text-center">
-                                        <h6 class="card-title text-muted">Space Saved</h6>
-                                        <div class="summary-value">{space_saved_gb:.2f} GB</div>
+                                    <div class="card-body">
+                                        {self.generate_compression_stats_html(compressor_status)}
                                     </div>
                                 </div>
                             </div>
                         </div>
                         
-                        <!-- Rest of the HTML template remains the same -->
-                        <!-- ... -->
+                        <!-- Database Stats Box -->
+                        <div class="row mb-4">
+                            <div class="col-12">
+                                <div class="card">
+                                    <div class="card-header">
+                                        <h5 class="mb-0">Database Statistics</h5>
+                                    </div>
+                                    <div class="card-body">
+                                        {self.generate_database_stats_html(db_stats)}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Active Jobs -->
+                        <div class="row mb-4">
+                            <div class="col-12">
+                                <div class="card">
+                                    <div class="card-header">
+                                        <h5 class="mb-0">Current Compression Progress</h5>
+                                    </div>
+                                    <div class="card-body">
+                                        {self.generate_active_jobs_html(active_jobs)}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Recent System Logs -->
+                        <div class="row mb-4">
+                            <div class="col-12">
+                                <div class="card">
+                                    <div class="card-header">
+                                        <h5 class="mb-0">Recent System Logs</h5>
+                                    </div>
+                                    <div class="card-body p-0">
+                                        <div class="logs-container">
+                                            {self.generate_logs_html(events)}
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <script>
+                        // Auto-scroll logs to bottom on page load
+                        window.onload = function() {
+                            var logsContainer = document.querySelector('.logs-container');
+                            if (logsContainer) {
+                                logsContainer.scrollTop = logsContainer.scrollHeight;
+                            }
+                        };
+                    </script>
+                </body>
+                </html>
                 """
                 return html
+                
+            def generate_scanner_stats_html(self, scanner_status):
+                """Generate HTML for the scanner stats box."""
+                if scanner_status.get("status") == "idle":
+                    return """
+                    <div class="text-center py-4">
+                        <div class="mb-3">
+                            <i class="bi bi-pause-circle" style="font-size: 2rem;"></i>
+                        </div>
+                        <h5>Scanner is currently idle</h5>
+                        <p class="text-muted">Use the "Start Scan" button to begin scanning.</p>
+                    </div>
+                    """
+                
+                # If scanning is active
+                files_scanned = scanner_status.get('files_scanned', 0)
+                new_files = scanner_status.get('new_files', 0)
+                changed_files = scanner_status.get('changed_files', 0)
+                progress = scanner_status.get('progress', 0)
+                current_dir = scanner_status.get('current_directory', 'N/A')
+                duration = scanner_status.get('duration', 0)
+                
+                # Format duration
+                if duration < 60:
+                    duration_str = f"{duration:.1f} seconds"
+                elif duration < 3600:
+                    minutes = int(duration // 60)
+                    seconds = int(duration % 60)
+                    duration_str = f"{minutes}m {seconds}s"
+                else:
+                    hours = int(duration // 3600)
+                    minutes = int((duration % 3600) // 60)
+                    duration_str = f"{hours}h {minutes}m"
+                
+                # Format ETA
+                eta_html = ""
+                if scanner_status.get('eta_seconds'):
+                    eta_seconds = scanner_status['eta_seconds']
+                    if eta_seconds < 60:
+                        eta_str = f"{int(eta_seconds)}s"
+                    elif eta_seconds < 3600:
+                        minutes = int(eta_seconds // 60)
+                        seconds = int(eta_seconds % 60)
+                        eta_str = f"{minutes}m {seconds}s"
+                    else:
+                        hours = int(eta_seconds // 3600)
+                        minutes = int((eta_seconds % 3600) // 60)
+                        eta_str = f"{hours}h {minutes}m"
+                    
+                    eta_html = f"""
+                    <div class="info-box bg-light">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <span><strong>Estimated Time Remaining:</strong></span>
+                            <span class="badge bg-info">{eta_str}</span>
+                        </div>
+                    </div>
+                    """
+                
+                # Create scanner stats HTML
+                return f"""
+                <div>
+                    <div class="progress mb-3">
+                        <div class="progress-bar progress-bar-striped progress-bar-animated" 
+                            role="progressbar" 
+                            style="width: {progress}%;" 
+                            aria-valuenow="{progress}" 
+                            aria-valuemin="0" 
+                            aria-valuemax="100">
+                            {progress:.1f}%
+                        </div>
+                    </div>
+                    
+                    {eta_html}
+                    
+                    <div class="info-box bg-light mb-3">
+                        <div class="text-muted mb-2">Currently Scanning:</div>
+                        <div class="file-path">{current_dir}</div>
+                    </div>
+                    
+                    <div class="row g-2 text-center">
+                        <div class="col-md-3">
+                            <div class="metric-circle bg-primary bg-opacity-10">
+                                <div class="metric-value">{files_scanned}</div>
+                                <div class="metric-label">Files Scanned</div>
+                            </div>
+                        </div>
+                        <div class="col-md-3">
+                            <div class="metric-circle bg-success bg-opacity-10">
+                                <div class="metric-value">{new_files}</div>
+                                <div class="metric-label">New Files</div>
+                            </div>
+                        </div>
+                        <div class="col-md-3">
+                            <div class="metric-circle bg-info bg-opacity-10">
+                                <div class="metric-value">{changed_files}</div>
+                                <div class="metric-label">Changed Files</div>
+                            </div>
+                        </div>
+                        <div class="col-md-3">
+                            <div class="metric-circle bg-warning bg-opacity-10">
+                                <div class="metric-value">{duration_str}</div>
+                                <div class="metric-label">Duration</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                """
+                
+            def generate_compression_stats_html(self, compressor_status):
+                """Generate HTML for the compression stats box."""
+                if compressor_status.get("status") == "idle":
+                    return """
+                    <div class="text-center py-4">
+                        <div class="mb-3">
+                            <i class="bi bi-pause-circle" style="font-size: 2rem;"></i>
+                        </div>
+                        <h5>Compressor is currently idle</h5>
+                        <p class="text-muted">Use the "Start Compression" button to begin compressing.</p>
+                    </div>
+                    """
+                
+                # If compression is active
+                files_processed = compressor_status.get('files_processed', 0)
+                errors = compressor_status.get('errors', 0)
+                duration = compressor_status.get('duration', 0)
+                duration_formatted = compressor_status.get('duration_formatted', '0s')
+                
+                # Get ETA information
+                eta_info = compressor_status.get('eta', {})
+                eta_formatted = eta_info.get('eta_formatted', 'Unknown')
+                remaining_files = eta_info.get('total_files', 0)
+                avg_time = eta_info.get('average_time_per_file', 0)
+                
+                # Get size information
+                original_size = compressor_status.get('total_original_size', 0)
+                compressed_size = compressor_status.get('total_compressed_size', 0)
+                
+                # Calculate savings
+                saved_size = original_size - compressed_size
+                if original_size > 0:
+                    savings_percent = (saved_size / original_size) * 100
+                else:
+                    savings_percent = 0
+                
+                # Format sizes for display
+                original_gb = original_size / (1024**3)
+                compressed_gb = compressed_size / (1024**3)
+                saved_gb = saved_size / (1024**3)
+                
+                return f"""
+                <div>
+                    <div class="row g-2 text-center mb-3">
+                        <div class="col-md-4">
+                            <div class="metric-circle bg-primary bg-opacity-10">
+                                <div class="metric-value">{files_processed}</div>
+                                <div class="metric-label">Files Processed</div>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="metric-circle bg-danger bg-opacity-10">
+                                <div class="metric-value">{errors}</div>
+                                <div class="metric-label">Errors</div>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="metric-circle bg-success bg-opacity-10">
+                                <div class="metric-value">{duration_formatted}</div>
+                                <div class="metric-label">Running Time</div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="info-box bg-light mb-3">
+                        <div class="status-row">
+                            <div class="status-label">ETA:</div>
+                            <div class="status-value">{eta_formatted}</div>
+                        </div>
+                        <div class="status-row">
+                            <div class="status-label">Remaining Files:</div>
+                            <div class="status-value">{remaining_files}</div>
+                        </div>
+                        <div class="status-row">
+                            <div class="status-label">Avg. Time/File:</div>
+                            <div class="status-value">{avg_time:.1f}s</div>
+                        </div>
+                    </div>
+                    
+                    <div class="info-box bg-light">
+                        <div class="status-row">
+                            <div class="status-label">Original Size:</div>
+                            <div class="status-value">{original_gb:.2f} GB</div>
+                        </div>
+                        <div class="status-row">
+                            <div class="status-label">Compressed Size:</div>
+                            <div class="status-value">{compressed_gb:.2f} GB</div>
+                        </div>
+                        <div class="status-row">
+                            <div class="status-label">Space Saved:</div>
+                            <div class="status-value">{saved_gb:.2f} GB ({savings_percent:.1f}%)</div>
+                        </div>
+                    </div>
+                </div>
+                """
+            
+            def generate_database_stats_html(self, db_stats):
+                """Generate HTML for the database stats box."""
+                # Get status counts with safe defaults
+                status_counts = db_stats.get('status_counts', {})
+                
+                # Parse individual statuses
+                new_files = status_counts.get('new', 0)
+                pending_files = status_counts.get('pending', 0)
+                in_progress_files = status_counts.get('in_progress', 0)
+                completed_files = status_counts.get('completed', 0)
+                skipped_files = status_counts.get('skipped', 0)
+                error_files = status_counts.get('error', 0)
+                paused_files = status_counts.get('paused', 0)
+                
+                # Get total file stats
+                total_files = db_stats.get('total_files', 0)
+                total_original_size = db_stats.get('total_original_size', 0)
+                total_compressed_size = db_stats.get('total_compressed_size', 0)
+                space_saved = db_stats.get('space_saved', 0)
+                savings_percentage = db_stats.get('savings_percentage', 0)
+                
+                # Calculate size in GB for display
+                original_size_gb = total_original_size / (1024**3)
+                compressed_size_gb = total_compressed_size / (1024**3)
+                space_saved_gb = space_saved / (1024**3)
+                
+                # Get processing time stats
+                processing_times = db_stats.get('processing_times', {})
+                avg_time = processing_times.get('average_seconds', 0)
+                min_time = processing_times.get('min_seconds', 0)
+                max_time = processing_times.get('max_seconds', 0)
+                
+                # Format times for display
+                if avg_time < 60:
+                    avg_time_str = f"{avg_time:.1f} seconds"
+                elif avg_time < 3600:
+                    avg_time_str = f"{avg_time/60:.1f} minutes"
+                else:
+                    avg_time_str = f"{avg_time/3600:.1f} hours"
+                
+                # Get estimated remaining time
+                estimated_time = db_stats.get('estimated_remaining_time', 0)
+                
+                if estimated_time < 60:
+                    eta_str = f"{estimated_time:.1f} seconds"
+                elif estimated_time < 3600:
+                    eta_str = f"{estimated_time/60:.1f} minutes"
+                elif estimated_time < 86400:
+                    eta_str = f"{estimated_time/3600:.1f} hours"
+                else:
+                    eta_str = f"{estimated_time/86400:.1f} days"
+                
+                return f"""
+                <div class="row">
+                    <!-- File Status Summary -->
+                    <div class="col-md-6">
+                        <h6 class="mb-3">File Status Summary</h6>
+                        <div class="row g-2">
+                            <div class="col-md-4">
+                                <div class="card bg-primary text-white">
+                                    <div class="card-body p-2 text-center">
+                                        <div class="h3">{total_files}</div>
+                                        <div class="text-xs text-white-50">TOTAL FILES</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-4">
+                                <div class="card bg-success text-white">
+                                    <div class="card-body p-2 text-center">
+                                        <div class="h3">{completed_files}</div>
+                                        <div class="text-xs text-white-50">COMPLETED</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-4">
+                                <div class="card bg-warning text-dark">
+                                    <div class="card-body p-2 text-center">
+                                        <div class="h3">{pending_files}</div>
+                                        <div class="text-xs text-dark-50">PENDING</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div class="table-responsive mt-3">
+                            <table class="table table-sm table-striped">
+                                <thead>
+                                    <tr>
+                                        <th>Status</th>
+                                        <th class="text-end">Count</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr>
+                                        <td>New</td>
+                                        <td class="text-end">{new_files}</td>
+                                    </tr>
+                                    <tr>
+                                        <td>In Progress</td>
+                                        <td class="text-end">{in_progress_files}</td>
+                                    </tr>
+                                    <tr>
+                                        <td>Skipped</td>
+                                        <td class="text-end">{skipped_files}</td>
+                                    </tr>
+                                    <tr>
+                                        <td>Error</td>
+                                        <td class="text-end">{error_files}</td>
+                                    </tr>
+                                    <tr>
+                                        <td>Paused</td>
+                                        <td class="text-end">{paused_files}</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                    
+                    <!-- Size and Time Statistics -->
+                    <div class="col-md-6">
+                        <h6 class="mb-3">Size and Time Statistics</h6>
+                        
+                        <div class="card mb-3">
+                            <div class="card-header bg-light py-1">
+                                <h6 class="mb-0">Storage Statistics</h6>
+                            </div>
+                            <div class="card-body p-3">
+                                <div class="row">
+                                    <div class="col-md-6">
+                                        <div class="info-box bg-light mb-2">
+                                            <div class="status-row">
+                                                <div class="status-label">Original Size:</div>
+                                                <div class="status-value">{original_size_gb:.2f} GB</div>
+                                            </div>
+                                            <div class="status-row">
+                                                <div class="status-label">Compressed Size:</div>
+                                                <div class="status-value">{compressed_size_gb:.2f} GB</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="col-md-6">
+                                        <div class="info-box bg-light">
+                                            <div class="status-row">
+                                                <div class="status-label">Space Saved:</div>
+                                                <div class="status-value">{space_saved_gb:.2f} GB</div>
+                                            </div>
+                                            <div class="status-row">
+                                                <div class="status-label">Savings:</div>
+                                                <div class="status-value">{savings_percentage:.1f}%</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div class="card">
+                            <div class="card-header bg-light py-1">
+                                <h6 class="mb-0">Time Statistics</h6>
+                            </div>
+                            <div class="card-body p-3">
+                                <div class="row">
+                                    <div class="col-md-6">
+                                        <div class="info-box bg-light mb-2">
+                                            <div class="status-row">
+                                                <div class="status-label">Avg. Processing Time:</div>
+                                                <div class="status-value">{avg_time_str}</div>
+                                            </div>
+                                            <div class="status-row">
+                                                <div class="status-label">Min Time:</div>
+                                                <div class="status-value">{min_time:.1f}s</div>
+                                            </div>
+                                            <div class="status-row">
+                                                <div class="status-label">Max Time:</div>
+                                                <div class="status-value">{max_time:.1f}s</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="col-md-6">
+                                        <div class="info-box bg-light">
+                                            <div class="status-row">
+                                                <div class="status-label">Estimated Time to Complete All:</div>
+                                                <div class="status-value">{eta_str}</div>
+                                            </div>
+                                            <div class="status-row">
+                                                <div class="status-label">Pending Files:</div>
+                                                <div class="status-value">{pending_files}</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                """
+                
+            def generate_active_jobs_html(self, active_jobs):
+                """Generate HTML for currently active compression jobs."""
+                if not active_jobs:
+                    return """
+                    <div class="text-center py-4">
+                        <p class="text-muted">No active compression jobs</p>
+                    </div>
+                    """
+                
+                jobs_html = ""
+                for job in active_jobs:
+                    # Get job details
+                    filename = job.get('filename', 'Unknown')
+                    full_path = job.get('full_path', 'Unknown')
+                    status = job.get('status', 'Unknown')
+                    stage = job.get('stage', 'Unknown')
+                    progress = job.get('progress', 0)
+                    size_mb = job.get('size_mb', 0)
+                    elapsed = job.get('elapsed_formatted', '0s')
+                    eta = job.get('eta_formatted', 'Unknown')
+                    
+                    # Determine stage style based on current stage
+                    stage_class = "bg-info"
+                    if stage == 'content analysis':
+                        stage_class = "bg-primary"
+                    elif stage == 'encoding':
+                        stage_class = "bg-success"
+                    elif stage == 'quality check':
+                        stage_class = "bg-warning"
+                    elif stage == 'finalizing':
+                        stage_class = "bg-dark"
+                    
+                    # Generate progress bar for this job
+                    progress_html = ""
+                    if progress > 0:
+                        progress_html = f"""
+                        <div class="progress mt-2" style="height: 12px;">
+                            <div class="progress-bar progress-bar-striped progress-bar-animated" 
+                                role="progressbar" 
+                                style="width: {progress}%;" 
+                                aria-valuenow="{progress}" 
+                                aria-valuemin="0" 
+                                aria-valuemax="100">
+                                {progress:.1f}%
+                            </div>
+                        </div>
+                        """
+                    
+                    jobs_html += f"""
+                    <div class="card mb-3">
+                        <div class="card-header bg-light py-2">
+                            <div class="d-flex justify-content-between align-items-center">
+                                <h6 class="mb-0">{filename}</h6>
+                                <span class="badge {stage_class}">{stage.upper()}</span>
+                            </div>
+                        </div>
+                        <div class="card-body pt-2 pb-2">
+                            <div class="file-path mb-2">{full_path}</div>
+                            
+                            <div class="row mb-2">
+                                <div class="col-md-3">
+                                    <small class="text-muted d-block">Size:</small>
+                                    <span>{size_mb:.2f} MB</span>
+                                </div>
+                                <div class="col-md-3">
+                                    <small class="text-muted d-block">Status:</small>
+                                    <span>{status.upper()}</span>
+                                </div>
+                                <div class="col-md-3">
+                                    <small class="text-muted d-block">Elapsed:</small>
+                                    <span>{elapsed}</span>
+                                </div>
+                                <div class="col-md-3">
+                                    <small class="text-muted d-block">ETA:</small>
+                                    <span>{eta}</span>
+                                </div>
+                            </div>
+                            
+                            {progress_html}
+                        </div>
+                    </div>
+                    """
+                
+                return jobs_html
+                
+            def generate_logs_html(self, events):
+                """Generate HTML for system logs in a scrollable container."""
+                if not events:
+                    return """<p class="text-muted p-3">No logs available</p>"""
+                
+                logs_html = ""
+                for event in events:
+                    # Get event details
+                    event_type = event.get('event_type', 'Unknown')
+                    severity = event.get('severity', 'info')
+                    timestamp = event.get('timestamp', '')
+                    details = event.get('details', '')
+                    
+                    # Format the timestamp
+                    formatted_time = timestamp
+                    if timestamp and 'T' in timestamp:
+                        date_part, time_part = timestamp.split('T')
+                        formatted_time = f"{date_part} {time_part[:8]}"
+                    
+                    # Set color based on severity
+                    severity_color = "text-info"
+                    if severity == 'error':
+                        severity_color = "text-danger"
+                    elif severity == 'warning':
+                        severity_color = "text-warning"
+                    
+                    logs_html += f"""
+                    <div class="log-entry">
+                        <span class="text-muted">[{formatted_time}]</span>
+                        <span class="{severity_color}">[{severity.upper()}]</span>
+                        <span class="text-light">{event_type}:</span>
+                        <span>{details}</span>
+                    </div>
+                    """
+                
+                return logs_html
             
             def generate_scanner_html(self, scanner_status):
                 """Generate HTML for scanner status."""
