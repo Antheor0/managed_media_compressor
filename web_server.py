@@ -370,13 +370,12 @@ class MediaCompressionWebServer:
                         </div>
                     </div>
                     <script>
-// Auto-scroll logs to bottom on page load
-window.onload = function() {
-    var logsContainer = document.querySelector('.logs-container');
-    if (logsContainer) {
-        logsContainer.scrollTop = logsContainer.scrollHeight;
-    }
-};
+                    window.onload = function() {
+                        var container = document.querySelector('.logs-container');
+                        if (container) {
+                            container.scrollTop = container.scrollHeight;
+                        }
+                    };
                     </script>
                 </body>
                 </html>
